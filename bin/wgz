@@ -1,0 +1,105 @@
+#!/usr/bin/env ruby
+
+# Add lib directory to load path
+lib = File.expand_path(File.dirname(__FILE__) + '/../lib')
+$LOAD_PATH.unshift(lib) if File.directory?(lib) && !$LOAD_PATH.include?(lib)
+
+#require "bundler/setup"
+require "optparse"
+require "goredar/logger"
+require "wgz/version"
+require "oj"
+
+LOG ||= Goredar::Logger.new STDERR
+LOG.level = Logger::INFO
+
+options = {
+  :triggers         => [],
+  :triggers_status  => [],
+  :config           => "~/.config/l1.conf",
+  :priority         => 1,
+  :output           => :auto,
+  :show_ack         => true,
+  :self_name        => Wgz::NAME,
+}
+
+op = OptionParser.new do |opts|
+
+  opts.banner = %Q{Grab triggers from zabbix and print them. Configuration is kept in #{options[:config]}.
+Default is to show unacknowledged triggers with priority higher or equal to 1 (Information).
+
+Usage: wgz [options] [filter(regexp)]
+}
+
+  opts.on("-e", "--all", "Show all triggers in problem state") { options[:triggers_status] = [:una, :ack, :mnt] }
+  opts.on("-u", "--unacknowledged", "Show unacknowledged triggers") { options[:triggers_status] << :una }
+  opts.on("-a", "--acknowledged", "Show acknowledged triggers") { options[:triggers_status] << :ack }
+  opts.on("-m", "--maintenance", "Show triggers with host in maintenance") { options[:triggers_status] << :mnt }
+  opts.on("-i", "--issue ISSUE", "Show triggers acknowledged with given issue (regexp)") do |issue|
+    options[:issue] = issue
+    options[:triggers_status] = [:una, :ack, :mnt]
+    options[:priority] = 1
+  end
+
+  opts.on("-h", "--host HOST", "Filter triggers by host (regexp)") { |host| options[:host] = host }
+  opts.on("-p", "--priority PRIORITY", "Filter triggers by priority (P, ~P, =P, P1..P2)") { |priority| options[:priority] = priority }
+
+  opts.on("-v", "--invert-match", "Reverse filters (hostname, trigger, issue)") { options[:reverse] = true }
+
+  opts.on("-c", "--compact", "Compact table output") { options[:output] = :compact }
+  opts.on("--no-colors", "Don't color output") { String.disable_colorization = true }
+
+  opts.on("--ack MESSAGE", "Acknowledge all matching triggers with given message") { |message| options[:do_ack] = message }
+  opts.on("--reack", "Reacknowledge all matching triggers with the last message") { |message| options[:do_ack] = :reack }
+
+  opts.on("--server", "Run caching server") { options[:server] = true }
+  opts.on("-u", "--update", "Force update if using caching server") { options[:update] = true }
+
+  opts.on("-s", "--mail", "Output as mail subject") { |expr| options[:output] = :mail }
+  opts.on("-t", "--table", "Force table output (default for tty)") { |expr| options[:output] = :table }
+  opts.on("-j", "--jira", "Output for pasting in jira") { |expr| options[:output] = :jira_desc }
+  opts.on("-n", "--hostnames", "Output hostnames only") { |expr| options[:output] = :hosts }
+  opts.on("--json", "Force JSON output (default for pipe)") { |expr| options[:output] = :json }
+
+  opts.on("--config CONFIG", "Grab configuration from CONFIG file") { |config| options[:config] = config }
+  opts.on("--debug", "set log level to debug severity") { LOG.level = Logger::DEBUG }
+
+  opts.on("--version", "Show version") { puts "#{options[:self_name]}: #{Wgz::VERSION}"; exit }
+  opts.on_tail("--help", "Show this message") { puts opts; exit }
+end
+
+begin
+  op.parse!
+rescue SystemExit
+  exit 0
+rescue Exception => e
+  LOG.error "[app] #{e.message}"
+  puts op
+  exit 1
+end
+
+triggers = $stdin.tty? ? [] : $stdin.readlines
+triggers.each do |line|
+  line = line.chomp
+  next if line.empty?
+  begin
+    trigger = Oj.load(line)
+    if trigger.include? "triggerid"
+      options[:triggers] << trigger
+    else
+      LOG.debug "[app] Not a valid tirgger: #{trigger}"
+    end
+  rescue Exception => e
+    LOG.warn "[app] Unable to parse stdin entry: #{line}"
+    LOG.debug "[app] #{e.message}"
+  end
+end
+
+
+options[:filter] = ARGV[0]
+options[:triggers_status] = options[:triggers_status].empty? ? [:una] : options[:triggers_status].uniq
+
+require "wgz"
+
+(CONF = Wgz.load_global_config(options[:config])) || exit(1)
+options[:server] ? Wgz.run_server : Wgz.process(options)
